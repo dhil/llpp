@@ -3308,6 +3308,39 @@ let genhistoutlines () =
   |> Array.of_list
 ;;
 
+let genhist key () =
+  Config.gethist ()
+  |> List.sort (fun (p1, c1, _, _, _, _) (p2, c2, _, _, _, _) ->
+                match key with
+                | `time -> compare c2.lastvisit c1.lastvisit
+                | `path -> compare p2 p1
+                | `name ->
+                   let b1 = Filename.basename p1
+                   and b2 = Filename.basename p2 in
+                   compare b2 b1
+                | `title ->
+                   let e1 = emptystr c1.title
+                   and e2 = emptystr c2.title in
+                   if e1 && e2
+                   then compare (Filename.basename p2) (Filename.basename p1)
+                   else (
+                     if e1
+                     then -1
+                     else (
+                       if e2
+                       then 1
+                       else compare c1.title c2.title
+                     )
+                   )
+               )
+  |> List.map
+       (fun ((path, c, _, _, _, _) as hist) ->
+        let base = mbtoutf8 @@ Filename.basename path in
+        (base ^ "\000" ^ c.title, hist)
+       )
+  |> Array.of_list
+;;
+
 let gotohist (path, c, bookmarks, x, anchor, origin) =
   Config.save leavebirdseye;
   state.anchor <- anchor;
@@ -4362,181 +4395,286 @@ let gotooutline (_, _, kind) =
   | Oremotedest remotedest -> gotounder (Uremotedest remotedest)
 ;;
 
+class virtual filterablesource fetch =
+object (self)
+  inherit lvsourcebase
+  val mutable m_items = E.a
+  val mutable m_minfo = E.a
+  val mutable m_orig_items = E.a
+  val mutable m_orig_minfo = E.a
+  val mutable m_narrow_patterns = []
+  val mutable m_hadremovals = false
+  val mutable m_gen = -1
+
+  method getitemcount =
+    dolog "getitemcount = %d" @@
+      Array.length m_items + (if m_hadremovals then 1 else 0);
+    Array.length m_items + (if m_hadremovals then 1 else 0)
+
+  method virtual getitem1 : int -> (string * int)
+  method getitem n =
+    if n == Array.length m_items && m_hadremovals
+    then ("[Confirm removal]", 0)
+    else self#getitem1 n
+
+  method hasaction (_:int) = true
+
+  method greetmsg =
+    if Array.length m_items != Array.length m_orig_items
+    then
+      let s =
+        match m_narrow_patterns with
+        | one :: [] -> one
+        | many -> String.concat "@Uellipsis" (List.rev many)
+      in
+      "Narrowed to " ^ s ^ " (ctrl-u to restore)"
+    else E.s
+
+  method statestr =
+    match m_narrow_patterns with
+    | [] -> E.s
+    | one :: [] -> one
+    | head :: _ -> "@Uellipsis" ^ head
+
+  method narrow pattern =
+    match Str.regexp_case_fold pattern with
+    | (exception _) -> ()
+    | re ->
+       let rec loop accu minfo n =
+         if n = -1
+         then (
+           m_items <- Array.of_list accu;
+           m_minfo <- Array.of_list minfo;
+         )
+         else
+           let s, _ = self#getitem1 n in
+           let accu, minfo =
+             match Str.search_forward re s 0 with
+             | (exception Not_found) -> accu, minfo
+             | first -> m_items.(n) :: accu, (first, Str.match_end ()) :: minfo
+           in
+           loop accu minfo (n-1)
+       in
+       loop [] [] (Array.length m_items - 1)
+
+  method! getminfo = m_minfo
+
+  method denarrow =
+    m_orig_items <- fetch ();
+    m_minfo <- m_orig_minfo;
+    m_items <- m_orig_items
+
+  method add_narrow_pattern pattern =
+    m_narrow_patterns <- pattern :: m_narrow_patterns
+
+  method del_narrow_pattern =
+    match m_narrow_patterns with
+    | _ :: rest -> m_narrow_patterns <- rest
+    | [] -> ()
+
+  method renarrow =
+    self#denarrow;
+    match m_narrow_patterns with
+    | pattern :: [] -> self#narrow pattern; pattern
+    | list ->
+       List.fold_left (fun accu pattern ->
+                       self#narrow pattern;
+                       pattern ^ "@Uellipsis" ^ accu) E.s list
+end;;
+
 let outlinesource sourcetype fetchoutlines =
   (object (self)
-    inherit lvsourcebase
-    val mutable m_items = E.a
-    val mutable m_minfo = E.a
-    val mutable m_orig_items = E.a
-    val mutable m_orig_minfo = E.a
-    val mutable m_narrow_patterns = []
-    val mutable m_hadremovals = false
-    val mutable m_gen = -1
+     inherit filterablesource fetchoutlines
 
-    method getitemcount =
-      Array.length m_items + (if m_hadremovals then 1 else 0)
+     method! getminfo = m_minfo
 
-    method getitem n =
-      if n == Array.length m_items && m_hadremovals
-      then
-        ("[Confirm removal]", 0)
-      else
-        let s, n, _ = m_items.(n) in
-        (s, n)
+     method getitem1 n =
+       let (s, n, _) = m_items.(n) in
+       (s, n)
 
-    method exit ~uioh ~cancel ~active ~first ~pan =
-      ignore (uioh, first);
-      let confrimremoval = m_hadremovals && active = Array.length m_items in
-      let items, minfo =
-        if m_narrow_patterns = []
-        then m_orig_items, m_orig_minfo
-        else m_items, m_minfo
-      in
-      m_pan <- pan;
-      if not cancel
-      then (
-        if not confrimremoval
-        then (
-          m_items <- items;
-          m_minfo <- minfo;
-          gotooutline m_items.(active);
-          None
+     method remove m =
+       if sourcetype = `bookmarks
+       then
+         if m >= 0 && m < Array.length m_items
+         then (
+           m_hadremovals <- true;
+           m_items <- Array.init (Array.length m_items - 1)
+                                 (fun n ->
+                                  let n = if n >= m then n+1 else n in
+                                  m_items.(n)
+                                 );
+           true
          )
-        else (
-          state.bookmarks <- Array.to_list m_items;
-          m_orig_items <- m_items;
-          m_orig_minfo <- m_minfo;
-          None
-         )
-       )
-      else (
-        m_items <- items;
-        m_minfo <- minfo;
-        None
-       )
+         else false
+       else false
 
-    method hasaction _ = true
-
-    method greetmsg =
-      if Array.length m_items != Array.length m_orig_items
-      then
-        let s =
-          match m_narrow_patterns with
-          | one :: [] -> one
-          | many -> String.concat "@Uellipsis" (List.rev many)
-        in
-        "Narrowed to " ^ s ^ " (ctrl-u to restore)"
-      else E.s
-
-    method statestr =
-      match m_narrow_patterns with
-      | [] -> E.s
-      | one :: [] -> one
-      | head :: _ -> "@Uellipsis" ^ head
-
-    method narrow pattern =
-      match Str.regexp_case_fold pattern with
-      | exception _ -> ()
-      | re ->
-          let rec loop accu minfo n =
-            if n = -1
-            then (
-              m_items <- Array.of_list accu;
-              m_minfo <- Array.of_list minfo;
-            )
-            else
-              let (s, _, _) as o = m_items.(n) in
-              let accu, minfo =
-                match Str.search_forward re s 0 with
-                | exception Not_found -> accu, minfo
-                | first -> o :: accu, (first, Str.match_end ()) :: minfo
-              in
-              loop accu minfo (n-1)
-          in
-          loop [] [] (Array.length m_items - 1)
-
-    method! getminfo = m_minfo
-
-    method denarrow =
-      m_orig_items <- fetchoutlines ();
-      m_minfo <- m_orig_minfo;
-      m_items <- m_orig_items
-
-    method remove m =
-      if sourcetype = `bookmarks
-      then
-        if m >= 0 && m < Array.length m_items
-        then (
-          m_hadremovals <- true;
-          m_items <- Array.init (Array.length m_items - 1) (fun n ->
-            let n = if n >= m then n+1 else n in
-            m_items.(n)
-          );
-          true
-        )
-        else false
-      else false
-
-    method add_narrow_pattern pattern =
-      m_narrow_patterns <- pattern :: m_narrow_patterns
-
-    method del_narrow_pattern =
-      match m_narrow_patterns with
-      | _ :: rest -> m_narrow_patterns <- rest
-      | [] -> ()
-
-    method renarrow =
-      self#denarrow;
-      match m_narrow_patterns with
-      | pattern :: [] -> self#narrow pattern; pattern
-      | list ->
-          List.fold_left (fun accu pattern ->
-            self#narrow pattern;
-            pattern ^ "@Uellipsis" ^ accu) E.s list
-
-    method calcactive anchor =
-      let rely = getanchory anchor in
-      let rec loop n best bestd =
-        if n = Array.length m_items
-        then best
-        else
-          let _, _, kind = m_items.(n) in
-          match kind with
-          | Oanchor anchor ->
+     method calcactive anchor =
+       let rely = getanchory anchor in
+       let rec loop n best bestd =
+         if n = Array.length m_items
+         then best
+         else
+           let _, _, kind = m_items.(n) in
+           match kind with
+           | Oanchor anchor ->
               let orely = getanchory anchor in
               let d = abs (orely - rely) in
               if d < bestd
               then loop (n+1) n d
               else loop (n+1) best bestd
-          | Onone | Oremote _ | Olaunch _
-          | Oremotedest _ | Ouri _ | Ohistory _ ->
-              loop (n+1) best bestd
-      in
-      loop 0 ~-1 max_int
+           | Onone | Oremote _ | Olaunch _
+           | Oremotedest _ | Ouri _ | Ohistory _ ->
+                                       loop (n+1) best bestd
+       in
+       loop 0 ~-1 max_int
 
-    method reset anchor items =
-      m_hadremovals <- false;
-      if state.gen != m_gen
+  method exit ~uioh ~cancel ~active ~first ~pan =
+    ignore (first+0);
+    let confrimremoval = m_hadremovals && active = Array.length m_items in
+    let items, minfo =
+      if m_narrow_patterns = []
+      then m_orig_items, m_orig_minfo
+      else m_items, m_minfo
+    in
+    m_pan <- pan;
+    if not cancel
+    then (
+      if not confrimremoval
       then (
-        m_orig_items <- items;
         m_items <- items;
-        m_narrow_patterns <- [];
-        m_minfo <- E.a;
-        m_orig_minfo <- E.a;
-        m_gen <- state.gen;
+        m_minfo <- minfo;
+        gotooutline m_items.(active);
+        if false then let u : uioh = uioh in Some u else None
       )
       else (
-        if items != m_orig_items
+        state.bookmarks <- Array.to_list m_items;
+        m_orig_items <- m_items;
+        m_orig_minfo <- m_minfo;
+        None
+      )
+    )
+    else (
+      m_items <- items;
+      m_minfo <- minfo;
+      None
+    )
+
+     method reset anchor items =
+       m_hadremovals <- false;
+       if state.gen != m_gen
+       then (
+         m_orig_items <- items;
+         m_items <- items;
+         m_narrow_patterns <- [];
+         m_minfo <- E.a;
+         m_orig_minfo <- E.a;
+         m_gen <- state.gen;
+       )
+       else (
+         if items != m_orig_items
+         then (
+           m_orig_items <- items;
+           if m_narrow_patterns == []
+           then m_items <- items;
+         )
+       );
+       let active = self#calcactive anchor in
+       m_active <- active;
+       m_first <- firstof m_first active
+   end)
+;;
+
+let histsource =
+  let order = ref `title in
+  let orf name ty =
+    (if !order = ty then "+" else " ") ^ "Sort by " ^ name,
+    (fun () -> dolog "here %d %d" (Obj.magic ty) (Obj.magic !order);
+               order := ty)
+  in
+  let actions =
+    [| orf "time of last visit" `time
+     ; orf "file name" `name
+     ; orf "path" `path
+     ; orf "title" `title |]
+  in
+  (object
+      inherit filterablesource (genhist !order) as super
+
+      method! getminfo = m_minfo
+      method! getitemcount = super#getitemcount
+                               + Array.length actions
+
+      method getitem1 n =
+        if n >= Array.length m_items
+        then
+          let m = n - Array.length m_items in
+          fst actions.(m), 0
+        else
+          let (s, _) = m_items.(n) in
+          (s, 0)
+
+      method remove (_:int) = false
+      method calcactive _ = 0
+
+      method exit ~uioh ~cancel ~active ~first ~pan =
+        ignore (uioh, first);
+        let confrimremoval = m_hadremovals && active = Array.length m_items in
+        let items, minfo =
+          if m_narrow_patterns = []
+          then m_orig_items, m_orig_minfo
+          else m_items, m_minfo
+        in
+        m_pan <- pan;
+        if not cancel
+        then (
+          if active >= Array.length m_items
+          then
+            let m = active - Array.length m_items in
+            let _, f = actions.(m) in
+            f ();
+            Some uioh
+          else
+            if not confrimremoval
+            then (
+              m_items <- items;
+              m_minfo <- minfo;
+              gotohist @@ snd m_items.(active);
+              None
+            )
+            else (
+              m_orig_items <- m_items;
+              m_orig_minfo <- m_minfo;
+              None
+            )
+        )
+        else (
+          m_items <- items;
+          m_minfo <- minfo;
+          None
+        )
+
+      method reset items =
+        m_hadremovals <- false;
+        if state.gen != m_gen
         then (
           m_orig_items <- items;
-          if m_narrow_patterns == []
-          then m_items <- items;
+          m_items <- items;
+          m_narrow_patterns <- [];
+          m_minfo <- E.a;
+          m_orig_minfo <- E.a;
+          m_gen <- state.gen;
         )
-      );
-      let active = self#calcactive anchor in
-      m_active <- active;
-      m_first <- firstof m_first active
-  end)
+        else (
+          if items != m_orig_items
+          then (
+            m_orig_items <- items;
+            if m_narrow_patterns == []
+            then m_items <- items;
+          )
+        );
+        m_active <- 0;
+        m_first <- firstof m_first 0
+    end)
 ;;
 
 let enteroutlinemode, enterbookmarkmode, enterhistmode =
@@ -4545,25 +4683,23 @@ let enteroutlinemode, enterbookmarkmode, enterhistmode =
       match sourcetype with
       | `bookmarks -> Array.of_list state.bookmarks
       | `outlines -> state.outlines
-      | `history -> genhistoutlines ()
     in
     let source = outlinesource sourcetype fetchoutlines in
     fun errmsg ->
-      let outlines = fetchoutlines () in
-      if Array.length outlines = 0
-      then (
-        showtext ' ' errmsg;
-       )
-      else (
-        resetmstate ();
-        Wsi.setcursor Wsi.CURSOR_INHERIT;
-        let anchor = getanchor () in
-        source#reset anchor outlines;
-        state.text <- source#greetmsg;
-        state.uioh <-
-          coe (new outlinelistview ~zebra:(sourcetype=`history) ~source);
-        G.postRedisplay "enter selector";
-       )
+    let outlines = fetchoutlines () in
+    if Array.length outlines = 0
+    then (
+      showtext ' ' errmsg;
+    )
+    else (
+      resetmstate ();
+      Wsi.setcursor Wsi.CURSOR_INHERIT;
+      let anchor = getanchor () in
+      source#reset anchor outlines;
+      state.text <- source#greetmsg;
+      state.uioh <- coe (new outlinelistview ~zebra:false ~source);
+      G.postRedisplay "enter selector";
+    )
   in
   let mkenter sourcetype errmsg =
     let enter = mkselector sourcetype in
@@ -4571,7 +4707,13 @@ let enteroutlinemode, enterbookmarkmode, enterhistmode =
   in
   (**)mkenter `outlines "Document has no outline"
     , mkenter `bookmarks "Document has no bookmarks (yet)"
-    , mkenter `history "History is empty"
+    , (fun () ->
+       histsource#reset @@ genhist `title ();
+       resetmstate ();
+       Wsi.setcursor Wsi.CURSOR_INHERIT;
+       state.uioh <- coe (new outlinelistview ~zebra:true ~source:histsource);
+       G.postRedisplay "enter history";
+      )
 ;;
 
 let quickbookmark ?title () =
